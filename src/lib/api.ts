@@ -57,6 +57,35 @@ export const TOOL_MAPPING: Record<TargetType, ToolName[]> = {
   'Log Data': ['Log Poisoner'],
 };
 
+// Frontend request logging
+const logFrontendRequest = (method: string, endpoint: string, status: number, duration: number) => {
+  const logEntry = {
+    id: `frontend-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+    timestamp: new Date().toISOString(),
+    level: status >= 400 ? 'error' : status >= 300 ? 'warning' : 'info',
+    source: 'Frontend',
+    message: `${method} ${endpoint} - ${status}`,
+    request: `${method} ${endpoint}`,
+    metadata: {
+      method,
+      endpoint,
+      status,
+      duration: Math.round(duration),
+      userAgent: navigator.userAgent,
+      url: window.location.href,
+    }
+  };
+
+  // Send to backend for logging (fire and forget)
+  fetch('http://localhost:8000/api/logs/frontend', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(logEntry),
+  }).catch(() => {
+    // Ignore errors - logging should not break the app
+  });
+};
+
 // HTTP Client
 class ApiClient {
   private baseUrl: string;
@@ -69,21 +98,33 @@ class ApiClient {
     endpoint: string,
     options?: RequestInit
   ): Promise<T> {
-    const url = `${this.baseUrl}${endpoint}`;
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
-    });
+    const startTime = Date.now();
+    const method = options?.method || 'GET';
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
-      throw new Error(error.detail || `HTTP ${response.status}`);
+    try {
+      const url = `${this.baseUrl}${endpoint}`;
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...options?.headers,
+        },
+      });
+
+      const duration = Date.now() - startTime;
+      logFrontendRequest(method, endpoint, response.status, duration);
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
+        throw new Error(error.detail || `HTTP ${response.status}`);
+      }
+
+      return response.json();
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      logFrontendRequest(method, endpoint, 0, duration); // 0 status for network errors
+      throw error;
     }
-
-    return response.json();
   }
 
   // Projects
@@ -134,32 +175,10 @@ class ApiClient {
     return this.request<Finding[]>(endpoint);
   }
 
-  async createJiraTicket(findingId: string): Promise<{ success: boolean; ticketId: string; url?: string; note?: string }> {
-    return this.request<{ success: boolean; ticketId: string; url?: string; note?: string }>(`/api/findings/${findingId}/jira`, {
+  async createJiraTicket(findingId: string): Promise<{ success: boolean; ticketId: string }> {
+    return this.request<{ success: boolean; ticketId: string }>(`/api/findings/${findingId}/jira`, {
       method: 'POST',
     });
-  }
-
-  async getJiraStatus(): Promise<{
-    configured: boolean;
-    message?: string;
-    server?: string;
-    project_key?: string;
-    username?: string;
-    connected?: boolean;
-    user?: any;
-    error?: string;
-  }> {
-    return this.request<{
-      configured: boolean;
-      message?: string;
-      server?: string;
-      project_key?: string;
-      username?: string;
-      connected?: boolean;
-      user?: any;
-      error?: string;
-    }>(`/api/jira/status`);
   }
 }
 
@@ -243,7 +262,6 @@ export const getScanResults = (projectId: string) => apiClient.getScanResults(pr
 export const getFindings = (projectId?: string) => apiClient.getFindings(projectId);
 
 export const createJiraTicket = (findingId: string) => apiClient.createJiraTicket(findingId);
-export const getJiraStatus = () => apiClient.getJiraStatus();
 
 // Chat Service Findings (port 8006)
 export interface ChatFinding {
@@ -253,6 +271,17 @@ export interface ChatFinding {
   payload: string;
   exposed_data: Record<string, any>;
   status: string;
+}
+
+export interface LogEntry {
+  id: string;
+  timestamp: string;
+  level: 'info' | 'warning' | 'error' | 'success';
+  source: string;
+  message: string;
+  ip?: string;
+  request?: string;
+  metadata?: Record<string, any>;
 }
 
 export async function getChatServiceFindings(): Promise<ChatFinding[]> {
@@ -265,6 +294,21 @@ export async function getChatServiceFindings(): Promise<ChatFinding[]> {
     return data.findings || [];
   } catch (error) {
     console.error('Failed to fetch chat service findings:', error);
+    return [];
+  }
+}
+
+export async function getLogs(limit?: number): Promise<LogEntry[]> {
+  try {
+    const params = limit ? `?limit=${limit}` : '';
+    const response = await fetch(`http://localhost:8000/api/logs${params}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.json();
+    return data || [];
+  } catch (error) {
+    console.error('Failed to fetch logs:', error);
     return [];
   }
 }

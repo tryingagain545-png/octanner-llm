@@ -32,7 +32,6 @@ interface DefenseSetting {
   severity: 'low' | 'medium' | 'high';
 }
 
-
 const containerVariants = {
   hidden: { opacity: 0 },
   visible: {
@@ -548,8 +547,6 @@ export default function Defense() {
             </CardContent>
           </Card>
         </motion.div>
-
-
       </div>
     </div>
   );

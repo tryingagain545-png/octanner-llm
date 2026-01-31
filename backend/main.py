@@ -3,18 +3,17 @@ AI Red Team Dashboard - Main FastAPI Orchestrator
 Coordinates security testing tools and manages scan lifecycle
 """
 
-from fastapi import FastAPI, WebSocket, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, WebSocket, HTTPException, BackgroundTasks, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import httpx
 import uuid
 import json
-import os
+import time
 from enum import Enum
-from atlassian import Jira
 
 app = FastAPI(title="AI Red Team Dashboard API", version="1.0.0")
 
@@ -26,6 +25,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Request Logging Middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+
+    # Get client IP
+    client_ip = request.client.host if request.client else "unknown"
+    if request.headers.get("X-Forwarded-For"):
+        client_ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
+    elif request.headers.get("X-Real-IP"):
+        client_ip = request.headers.get("X-Real-IP")
+
+    # Process request
+    response = await call_next(request)
+    process_time = time.time() - start_time
+
+    # Create log entry
+    log_entry = LogEntry(
+        id=f"req-{uuid.uuid4().hex[:8]}",
+        timestamp=datetime.now(timezone.utc),
+        level="info",
+        source="API Server",
+        message=f"{request.method} {request.url.path} - {response.status_code}",
+        ip=client_ip,
+        request=f"{request.method} {request.url.path}",
+        metadata={
+            "method": request.method,
+            "path": request.url.path,
+            "query_params": str(request.url.query),
+            "status_code": response.status_code,
+            "process_time": round(process_time * 1000, 2),  # ms
+            "user_agent": request.headers.get("User-Agent", ""),
+            "content_length": request.headers.get("Content-Length", ""),
+        }
+    )
+
+    # Store log
+    request_logs.append(log_entry)
+
+    # Keep only last 1000 request logs
+    if len(request_logs) > 1000:
+        request_logs.pop(0)
+
+    # Broadcast to WebSocket clients
+    await broadcast_log_update()
+
+    return response
 
 # Tool Endpoints Configuration
 TOOL_ENDPOINTS = {
@@ -93,11 +140,29 @@ class Finding(BaseModel):
     mitigation: str
     timestamp: datetime
 
+class LogEntry(BaseModel):
+    id: str
+    timestamp: datetime
+    level: str  # info, warning, error, success
+    source: str
+    message: str
+    ip: Optional[str] = None
+    request: Optional[str] = None
+    metadata: Optional[Dict] = None
+
+    model_config = ConfigDict(
+        json_encoders={
+            datetime: lambda v: v.isoformat()
+        }
+    )
+
 # In-memory storage (replace with database in production)
 projects_db: Dict[str, Project] = {}
 scans_db: Dict[str, ScanResult] = {}
 findings_db: Dict[str, Finding] = {}
 active_websockets: Dict[str, List[WebSocket]] = {}
+logs_websockets: List[WebSocket] = []
+request_logs: List[LogEntry] = []
 
 # Defense system storage
 defense_settings_db: Dict[str, Dict] = {
@@ -113,55 +178,6 @@ defense_settings_db: Dict[str, Dict] = {
     "log_data_sanitization": {"enabled": False, "category": "log", "severity": "medium"},
 }
 
-# Jira Configuration
-class JiraConfig(BaseModel):
-    server: str
-    username: str
-    api_token: str
-    project_key: str
-    issue_type: str = "Bug"
-    priority_field: str = "priority"
-
-# Jira client instance
-jira_client: Optional[Jira] = None
-
-def get_jira_config() -> Optional[JiraConfig]:
-    """Get Jira configuration from environment variables"""
-    server = os.getenv("JIRA_SERVER")
-    username = os.getenv("JIRA_USERNAME")
-    api_token = os.getenv("JIRA_API_TOKEN")
-    project_key = os.getenv("JIRA_PROJECT_KEY")
-
-    if not all([server, username, api_token, project_key]):
-        return None
-
-    return JiraConfig(
-        server=server,
-        username=username,
-        api_token=api_token,
-        project_key=project_key
-    )
-
-def init_jira_client() -> Optional[Jira]:
-    """Initialize Jira client if configuration is available"""
-    global jira_client
-    config = get_jira_config()
-    if config:
-        try:
-            jira_client = Jira(
-                url=config.server,
-                username=config.username,
-                password=config.api_token
-            )
-            return jira_client
-        except Exception as e:
-            print(f"Failed to initialize Jira client: {e}")
-            return None
-    return None
-
-# Initialize Jira client on startup
-jira_client = init_jira_client()
-
 # API Endpoints
 
 @app.get("/")
@@ -170,7 +186,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc)}
 
 # Projects
 @app.post("/api/projects", response_model=Project)
@@ -178,7 +194,7 @@ async def create_project(project: ProjectCreate):
     project_id = f"proj_{uuid.uuid4().hex[:8]}"
     new_project = Project(
         id=project_id,
-        createdAt=datetime.utcnow(),
+        createdAt=datetime.now(timezone.utc),
         **project.dict()
     )
     projects_db[project_id] = new_project
@@ -196,13 +212,33 @@ async def get_project(project_id: str):
 
 # Scans
 @app.post("/api/scans/start")
-async def start_scan(scan_request: ScanRequest, background_tasks: BackgroundTasks):
+async def start_scan(scan_request: ScanRequest, background_tasks: BackgroundTasks, request: Request):
     scan_id = f"scan_{uuid.uuid4().hex[:8]}"
-    
+
     # Verify project exists
     if scan_request.projectId not in projects_db:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
+    # Log scan initiation
+    client_ip = request.client.host if request.client else "unknown"
+    scan_start_log = LogEntry(
+        id=f"scan-start-{scan_id}",
+        timestamp=datetime.now(timezone.utc),
+        level="info",
+        source="Scan Orchestrator",
+        message=f"Scan initiated: {scan_id} for project {scan_request.projectId}",
+        ip=client_ip,
+        request=f"POST /api/scans/start",
+        metadata={
+            "scanId": scan_id,
+            "projectId": scan_request.projectId,
+            "tools": [t.value for t in scan_request.tools],
+            "event": "scan_started"
+        }
+    )
+    request_logs.append(scan_start_log)
+    await broadcast_log_update()
+
     # Start scan in background
     background_tasks.add_task(
         execute_scan,
@@ -210,7 +246,7 @@ async def start_scan(scan_request: ScanRequest, background_tasks: BackgroundTask
         scan_request.projectId,
         scan_request.tools
     )
-    
+
     return {"scanId": scan_id, "status": "started"}
 
 async def execute_scan(scan_id: str, project_id: str, tools: List[ToolName]):
@@ -225,7 +261,7 @@ async def execute_scan(scan_id: str, project_id: str, tools: List[ToolName]):
             toolName=tool,
             status="running",
             logs=[],
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         scans_db[result_id] = result
         
@@ -256,17 +292,19 @@ async def execute_scan(scan_id: str, project_id: str, tools: List[ToolName]):
                                         msg = log_data.get("message", "")
                                         result.logs.append(msg)
                                         await broadcast_log(scan_id, f"[{tool.value}] {msg}")
-                                    
+                                        await broadcast_log_update()
+
                                     elif log_data.get("type") == "progress":
                                         progress = log_data.get("percentage", 0)
                                         current = log_data.get("current", 0)
                                         total = log_data.get("total", 0)
                                         await broadcast_log(scan_id, f"[{tool.value}] Progress: {current}/{total} ({progress}%)")
-                                    
+
                                     elif log_data.get("type") == "test_result":
                                         test_result = log_data.get("result", "")
                                         result.logs.append(test_result)
                                         await broadcast_log(scan_id, f"[{tool.value}] {test_result}")
+                                        await broadcast_log_update()
                                     
                                     elif log_data.get("type") == "metrics":
                                         # Store metrics from stream
@@ -349,12 +387,33 @@ async def execute_scan(scan_id: str, project_id: str, tools: List[ToolName]):
 4. Rate Limiting & Anomaly Detection
 5. Defense in Depth
 6. Regular Security Testing""",
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(timezone.utc)
             )
             findings_db[finding.id] = finding
         
         scans_db[result_id] = result
         await broadcast_complete(scan_id, result)
+
+        # Log scan completion
+        scan_complete_log = LogEntry(
+            id=f"scan-complete-{result_id}",
+            timestamp=datetime.now(timezone.utc),
+            level="success" if result.status == "completed" else "error",
+            source="Scan Orchestrator",
+            message=f"Scan completed: {result_id} - {result.status}",
+            request=f"Scan {scan_id}",
+            metadata={
+                "scanId": scan_id,
+                "resultId": result_id,
+                "projectId": project_id,
+                "tool": tool.value,
+                "status": result.status,
+                "severity": result.severity.value if result.severity else None,
+                "event": "scan_completed"
+            }
+        )
+        request_logs.append(scan_complete_log)
+        await broadcast_log_update()
 
 @app.get("/api/scans", response_model=List[ScanResult])
 async def get_all_scans():
@@ -411,6 +470,75 @@ async def broadcast_complete(scan_id: str, result: ScanResult):
             except:
                 pass
 
+# WebSocket for real-time logs
+logs_websockets: List[WebSocket] = []
+
+@app.websocket("/api/logs/stream")
+async def logs_websocket_endpoint(websocket: WebSocket):
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    await websocket.accept()
+    logs_websockets.append(websocket)
+
+    # Log WebSocket connection
+    ws_log = LogEntry(
+        id=f"ws-connect-{uuid.uuid4().hex[:8]}",
+        timestamp=datetime.now(timezone.utc),
+        level="info",
+        source="WebSocket Server",
+        message="WebSocket connection established for logs",
+        ip=client_ip,
+        request="WebSocket /api/logs/stream",
+        metadata={"event": "connect"}
+    )
+    request_logs.append(ws_log)
+    await broadcast_log_update()
+
+    try:
+        while True:
+            # Keep connection alive and periodically send latest logs
+            await asyncio.sleep(5)  # Send updates every 5 seconds
+            try:
+                recent_logs = await get_logs(50)  # Get 50 most recent logs
+                await websocket.send_json({
+                    "type": "logs_update",
+                    "logs": [log.dict() for log in recent_logs]
+                })
+            except:
+                pass
+    except Exception as e:
+        print(f"Logs WebSocket error: {e}")
+    finally:
+        logs_websockets.remove(websocket)
+        # Log WebSocket disconnection
+        ws_disconnect_log = LogEntry(
+            id=f"ws-disconnect-{uuid.uuid4().hex[:8]}",
+            timestamp=datetime.now(timezone.utc),
+            level="info",
+            source="WebSocket Server",
+            message="WebSocket connection closed for logs",
+            ip=client_ip,
+            request="WebSocket /api/logs/stream",
+            metadata={"event": "disconnect"}
+        )
+        request_logs.append(ws_disconnect_log)
+        await broadcast_log_update()
+
+async def broadcast_log_update():
+    """Broadcast log updates to all connected log clients"""
+    if logs_websockets:
+        try:
+            recent_logs = await get_logs(50)
+            for ws in logs_websockets:
+                try:
+                    await ws.send_json({
+                        "type": "logs_update",
+                        "logs": [log.dict() for log in recent_logs]
+                    })
+                except:
+                    pass
+        except:
+            pass
+
 # Findings
 async def fetch_chat_service_findings():
     """Fetch findings from the vulnerable chat service on port 8006"""
@@ -445,7 +573,7 @@ async def fetch_chat_service_findings():
                         description=f"Detected in Ollama chat service: {cf.get('type', 'Unknown')}",
                         evidence=f"Payload: {cf.get('payload', 'N/A')}\n\nExposed Data: {json.dumps(cf.get('exposed_data', {}), indent=2)}",
                         mitigation="Implement input validation and sanitization in the chat service. Use prompt guards and content filtering.",
-                        timestamp=datetime.fromisoformat(cf.get('timestamp', datetime.utcnow().isoformat()).replace('Z', '+00:00'))
+                        timestamp=datetime.fromisoformat(cf.get('timestamp', datetime.now(timezone.utc).isoformat()).replace('Z', '+00:00'))
                     )
                     transformed.append(finding)
                 
@@ -527,127 +655,102 @@ async def get_defense_status():
         "protection_level": "full" if enabled_count == total_count else "partial" if enabled_count > 0 else "none"
     }
 
-@app.get("/api/jira/status")
-async def get_jira_status():
-    """Get Jira integration status"""
-    config = get_jira_config()
-    if not config:
-        return {
-            "configured": False,
-            "message": "Jira not configured. Set JIRA_SERVER, JIRA_USERNAME, JIRA_API_TOKEN, and JIRA_PROJECT_KEY environment variables."
-        }
-
-    # Test connection
-    try:
-        if jira_client:
-            # Try to get current user to test connection
-            user = jira_client.current_user()
-            return {
-                "configured": True,
-                "server": config.server,
-                "project_key": config.project_key,
-                "username": config.username,
-                "connected": True,
-                "user": user
-            }
-        else:
-            return {
-                "configured": True,
-                "server": config.server,
-                "project_key": config.project_key,
-                "username": config.username,
-                "connected": False,
-                "error": "Failed to initialize Jira client"
-            }
-    except Exception as e:
-        return {
-            "configured": True,
-            "server": config.server,
-            "project_key": config.project_key,
-            "username": config.username,
-            "connected": False,
-            "error": str(e)
-        }
-
 @app.post("/api/findings/{finding_id}/jira")
 async def create_jira_ticket(finding_id: str):
-    """Create a JIRA ticket for a security finding"""
+    """Mock JIRA integration - replace with real JIRA API"""
     if finding_id not in findings_db:
         raise HTTPException(status_code=404, detail="Finding not found")
 
     finding = findings_db[finding_id]
-    config = get_jira_config()
 
-    if not config or not jira_client:
-        # Fallback to mock ticket if Jira is not configured
-        ticket_id = f"AIRSEC-{uuid.uuid4().hex[:4].upper()}"
-        return {
-            "success": True,
-            "ticketId": ticket_id,
-            "url": f"https://your-jira.atlassian.net/browse/{ticket_id}",
-            "note": "Jira not configured - using mock ticket"
-        }
+    # TODO: Implement real JIRA API integration
+    # For now, return mock ticket
+    ticket_id = f"AIRSEC-{uuid.uuid4().hex[:4].upper()}"
 
-    try:
-        # Map severity to Jira priority
-        priority_map = {
-            "critical": "Highest",
-            "high": "High",
-            "medium": "Medium",
-            "low": "Low",
-            "info": "Lowest"
-        }
+    return {
+        "success": True,
+        "ticketId": ticket_id,
+        "url": f"https://your-jira.atlassian.net/browse/{ticket_id}"
+    }
 
-        # Create the issue
-        issue_dict = {
-            'project': {'key': config.project_key},
-            'summary': f"Security Finding: {finding['title']}",
-            'description': f"""
-Security Finding Details:
+@app.post("/api/logs/frontend")
+async def log_frontend_request(log_entry: LogEntry):
+    """Receive frontend request logs"""
+    request_logs.append(log_entry)
 
-**Title:** {finding['title']}
-**Severity:** {finding['severity']}
-**Type:** {finding['type']}
-**Description:** {finding.get('description', 'N/A')}
+    # Keep only last 1000 request logs
+    if len(request_logs) > 1000:
+        request_logs.pop(0)
 
-**Payload:** {finding.get('payload', 'N/A')}
-**Exposed Data:** {finding.get('exposed_data', 'N/A')}
+    # Broadcast to WebSocket clients
+    await broadcast_log_update()
 
-**Timestamp:** {finding.get('timestamp', 'N/A')}
-**Finding ID:** {finding_id}
+    return {"status": "logged"}
 
-This ticket was automatically created by the AI Red Team Dashboard.
-            """,
-            'issuetype': {'name': config.issue_type},
-            'priority': {'name': priority_map.get(finding['severity'].lower(), 'Medium')}
-        }
+@app.get("/api/logs", response_model=List[LogEntry])
+async def get_logs(limit: int = Query(1000, description="Maximum number of log entries to return")):
+    """Get aggregated logs from all sources"""
+    log_entries: List[LogEntry] = []
 
-        # Add custom fields if needed
-        if finding.get('tool'):
-            issue_dict['customfield_10001'] = finding['tool']  # Adjust field ID as needed
+    # Process scan logs
+    for scan_id, scan in scans_db.items():
+        # Add scan status logs
+        log_entries.append(LogEntry(
+            id=f"{scan_id}-status",
+            timestamp=scan.timestamp,
+            level="success" if scan.status == "completed" else "error" if scan.status == "failed" else "info",
+            source=scan.toolName,
+            message=f"Scan {scan.status}",
+            request=f"Scan {scan_id}",
+            metadata={
+                "scanId": scan_id,
+                "projectId": scan.projectId,
+                "status": scan.status,
+            }
+        ))
 
-        # Create the issue
-        result = jira_client.create_issue(fields=issue_dict)
+        # Add individual log messages from scan
+        for idx, log_message in enumerate(scan.logs):
+            log_entries.append(LogEntry(
+                id=f"{scan_id}-log-{idx}",
+                timestamp=scan.timestamp,
+                level="error" if "error" in log_message.lower() else
+                     "warning" if "warning" in log_message.lower() else
+                     "success" if "success" in log_message.lower() or "completed" in log_message.lower() else "info",
+                source=scan.toolName,
+                message=log_message,
+                request=f"Scan {scan_id}",
+                metadata={
+                    "scanId": scan_id,
+                    "projectId": scan.projectId,
+                }
+            ))
 
-        ticket_id = result['key']
-        ticket_url = f"{config.server}/browse/{ticket_id}"
+    # Process finding logs
+    for finding_id, finding in findings_db.items():
+        log_entries.append(LogEntry(
+            id=f"finding-{finding_id}",
+            timestamp=finding.timestamp,
+            level="error" if finding.severity == "Critical" else
+                 "warning" if finding.severity in ["High", "Medium"] else "info",
+            source="Security Scanner",
+            message=f"Security finding: {finding.title}",
+            request=f"Finding {finding_id}",
+            metadata={
+                "findingId": finding_id,
+                "scanId": finding.scanId,
+                "severity": finding.severity,
+                "description": finding.description,
+            }
+        ))
 
-        return {
-            "success": True,
-            "ticketId": ticket_id,
-            "url": ticket_url
-        }
+    # Process request logs
+    for req_log in request_logs:
+        log_entries.append(req_log)
 
-    except Exception as e:
-        print(f"Failed to create Jira ticket: {e}")
-        # Fallback to mock ticket on error
-        ticket_id = f"AIRSEC-{uuid.uuid4().hex[:4].upper()}"
-        return {
-            "success": True,
-            "ticketId": ticket_id,
-            "url": f"https://your-jira.atlassian.net/browse/{ticket_id}",
-            "note": f"Jira API error: {str(e)}"
-        }
+    # Sort by timestamp (newest first) and limit
+    log_entries.sort(key=lambda x: x.timestamp, reverse=True)
+    return log_entries[:limit]
 
 if __name__ == "__main__":
     import uvicorn

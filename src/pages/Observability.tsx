@@ -249,13 +249,23 @@ export default function Observability() {
                 {lastUpdated && <span className="ml-4 text-cyan-400">● Auto-updating • Last: {lastUpdated}</span>}
               </p>
             </div>
-            <Button
-              onClick={loadMetrics}
-              className="bg-cyan-500 hover:bg-cyan-600"
-            >
-              <Activity className="w-4 h-4 mr-2" />
-              Refresh Now
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                onClick={() => navigate('/logs')}
+                variant="outline"
+                className="border-gray-700 hover:bg-gray-800"
+              >
+                <Activity className="w-4 h-4 mr-2" />
+                View Logs
+              </Button>
+              <Button
+                onClick={loadMetrics}
+                className="bg-cyan-500 hover:bg-cyan-600"
+              >
+                <Activity className="w-4 h-4 mr-2" />
+                Refresh Now
+              </Button>
+            </div>
           </div>
         </motion.div>
 

@@ -48,6 +48,7 @@ import Scanner from "./pages/Scanner";
 import Dashboard from "./pages/Dashboard";
 import Findings from "./pages/Findings";
 import Observability from "./pages/Observability";
+import Logs from "./pages/Logs";
 import Chat from "./pages/Chat";
 import Defense from "./pages/Defense";
 import NotFound from "./pages/NotFound";
@@ -77,6 +78,7 @@ const App = () => {
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/findings" element={<Findings />} />
             <Route path="/observability" element={<Observability />} />
+            <Route path="/logs" element={<Logs />} />
             <Route path="/chat" element={<Chat />} />
             <Route path="/defense" element={<Defense />} />
             <Route path="*" element={<NotFound />} />

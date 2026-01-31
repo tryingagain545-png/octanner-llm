@@ -47,20 +47,7 @@ export default function Findings() {
     setCreatingTicket(findingId);
     try {
       const result = await createJiraTicket(findingId);
-      if (result.url) {
-        toast.success(`JIRA ticket ${result.ticketId} created successfully!`, {
-          action: {
-            label: 'View Ticket',
-            onClick: () => window.open(result.url, '_blank'),
-          },
-        });
-      } else {
-        toast.success(`JIRA ticket ${result.ticketId} created successfully!`);
-      }
-
-      if (result.note) {
-        toast.info(result.note);
-      }
+      toast.success(`JIRA ticket ${result.ticketId} created successfully!`);
     } catch (error) {
       toast.error('Failed to create JIRA ticket');
     } finally {
